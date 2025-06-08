@@ -1,90 +1,147 @@
-# Импорт библиотек
+import os
+import random
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras.preprocessing.text import Tokenizer
-from tensorflow.keras.preprocessing.sequence import pad_sequences
+
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Embedding, LSTM, Dense
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.utils import to_categorical
-from tensorflow.keras.callbacks import EarlyStopping
-import random
-import os
+from tensorflow.keras.layers import Embedding, LSTM, Dense, Activation
+from tensorflow.keras.optimizers import RMSprop
+from tensorflow.keras.callbacks import ModelCheckpoint, ReduceLROnPlateau
 
-# Пути
-input_path = 'input.txt'
-output_model_path = 'lstm_model.keras'
-output_gen_path = 'gen.txt'
+# ==== ПАРАМЕТРЫ ====
+INPUT_PATH = 'input.txt'
+MODEL_WEIGHTS = 'best_weights.h5'
+GENERATED_PATH = 'gen.txt'
+MAX_LENGTH = 10
+STEP = 1
+EMBEDDING_DIM = 100
+LSTM_UNITS = 128
+BATCH_SIZE = 128
+EPOCHS = 50
+LEARNING_RATE = 0.01
+PATIENCE_LR = 3  # patience for ReduceLROnPlateau
+TEMPERATURE = 0.2
+GENERATED_WORDS = 1000
 
-# Загрузка текста
-with open(input_path, encoding='utf-8') as f:
-    text = f.read()
 
-# Предобработка
-seq_length = 30
-tokenizer = Tokenizer(char_level=True)
-tokenizer.fit_on_texts([text])
-total_chars = len(tokenizer.word_index) + 1
+# ==== ФУНКЦИИ ====
 
-sequences = []
-for i in range(seq_length, len(text)):
-    seq = text[i - seq_length:i + 1]
-    sequences.append(tokenizer.texts_to_sequences([seq])[0])
-sequences = np.array(sequences)
+def load_text(path: str) -> str:
+    """Читает и возвращает содержимое файла."""
+    with open(path, 'r', encoding='utf-8') as f:
+        return f.read()
 
-xs = sequences[:, :-1]
-ys = to_categorical(sequences[:, -1], num_classes=total_chars)
 
-# Модель
-model = Sequential([
-    Embedding(input_dim=total_chars, output_dim=64, input_length=seq_length),
-    LSTM(128),
-    Dense(total_chars, activation='softmax')
-])
-model.compile(
-    loss='categorical_crossentropy',
-    optimizer=Adam(learning_rate=0.001),
-    metrics=['accuracy']
-)
+def prepare_data(text: str):
+    """Токенизация по словам и подготовка входных (X) и целевых (y) массивов."""
+    words = text.split()
+    vocab = sorted(set(words))
+    word_to_idx = {w: i for i, w in enumerate(vocab)}
+    idx_to_word = {i: w for i, w in enumerate(vocab)}
 
-# Обучение с ранней остановкой
-early_stopping = EarlyStopping(
-    monitor='val_accuracy', patience=5, restore_best_weights=True
-)
+    # Преобразуем в индексы
+    seq_indices = [word_to_idx[w] for w in words]
 
-print("=== START TRAINING ===")
-model.fit(
-    xs, ys,
-    epochs=50,
-    batch_size=128,
-    validation_split=0.2,
-    callbacks=[early_stopping],
-    verbose=1
-)
-print("=== TRAINING COMPLETE ===\n")
+    sentences, next_words = [], []
+    for i in range(0, len(seq_indices) - MAX_LENGTH, STEP):
+        sentences.append(seq_indices[i: i + MAX_LENGTH])
+        next_words.append(seq_indices[i + MAX_LENGTH])
 
-# 1) Генерация текста
-def generate_text(seed_text, length=8000, temperature=1.0):
-    result = seed_text
-    for _ in range(length):
-        enc = tokenizer.texts_to_sequences([result[-seq_length:]])[0]
-        enc = pad_sequences([enc], maxlen=seq_length)
-        probs = model.predict(enc, verbose=0)[0]
-        probs = np.log(probs + 1e-8) / temperature
-        exp = np.exp(probs)
-        probs = exp / np.sum(exp)
-        idx = np.random.choice(range(total_chars), p=probs)
-        result += tokenizer.index_word[idx]
-    return result
+    # Создаём массивы
+    X = np.array(sentences, dtype=np.int32)
+    y = np.zeros((len(sentences), len(vocab)), dtype=np.bool_)
+    for i, idx in enumerate(next_words):
+        y[i, idx] = 1
 
-print("=== GENERATING TEXT ===")
-seed = random.choice(text.split())
-generated = generate_text(seed, temperature=1.0)
-with open(output_gen_path, 'w', encoding='utf-8') as f:
-    f.write(generated)
-print(f"Сгенерированный текст сохранён в {output_gen_path}\n")
+    return X, y, word_to_idx, idx_to_word, len(vocab)
 
-# 2) Сохранение полной модели
-print("=== SAVING MODEL ===")
-model.save(output_model_path)
-print(f"Модель сохранена в {output_model_path}")
+
+def build_model(vocab_size: int) -> tf.keras.Model:
+    """Строит и компилирует модель."""
+    model = Sequential([
+        Embedding(input_dim=vocab_size, output_dim=EMBEDDING_DIM, input_length=MAX_LENGTH),
+        LSTM(LSTM_UNITS),
+        Dense(vocab_size),
+        Activation('softmax'),
+    ])
+    optimizer = RMSprop(learning_rate=LEARNING_RATE)
+    model.compile(loss='categorical_crossentropy', optimizer=optimizer)
+    return model
+
+
+def sample(preds: np.ndarray, temperature: float) -> int:
+    """Сэмплинг с учётом температуры."""
+    preds = np.asarray(preds).astype('float64')
+    preds = np.log(preds + 1e-8) / temperature
+    exp_preds = np.exp(preds)
+    preds = exp_preds / np.sum(exp_preds)
+    return np.argmax(np.random.multinomial(1, preds, 1))
+
+
+def generate_and_save(model: tf.keras.Model,
+                      idx_to_word: dict,
+                      seq_indices: list,
+                      num_words: int,
+                      temperature: float,
+                      out_path: str):
+    """Генерирует текст и сохраняет в файл."""
+    start_idx = random.randint(0, len(seq_indices) - MAX_LENGTH - 1)
+    sentence = seq_indices[start_idx: start_idx + MAX_LENGTH]
+    generated = sentence.copy()
+
+    for _ in range(num_words):
+        x_pred = np.array([sentence], dtype=np.int32)
+        preds = model.predict(x_pred, verbose=0)[0]
+        next_idx = sample(preds, temperature)
+        generated.append(next_idx)
+        sentence = sentence[1:] + [next_idx]
+
+    text = ' '.join(idx_to_word[i] for i in generated)
+    with open(out_path, 'w', encoding='utf-8') as f:
+        f.write(text)
+    print(f"Сгенерированный текст сохранён в {out_path}")
+
+
+def main():
+    # 1. Загрузка и подготовка данных
+    text = load_text(INPUT_PATH)
+    X, y, w2i, i2w, vocab_size = prepare_data(text)
+    print(f"Загружено {len(text.split())} слов, словарь: {vocab_size} токенов.")
+
+    # 2. Построение модели
+    model = build_model(vocab_size)
+
+    # 3. Колбэки
+    checkpoint = ModelCheckpoint(
+        filepath=MODEL_WEIGHTS,
+        save_best_only=True,
+        monitor='loss',
+        verbose=1
+    )
+    reduce_lr = ReduceLROnPlateau(
+        monitor='loss',
+        factor=0.5,
+        patience=PATIENCE_LR,
+        verbose=1
+    )
+
+    # 4. Обучение
+    model.fit(
+        X, y,
+        batch_size=BATCH_SIZE,
+        epochs=EPOCHS,
+        callbacks=[checkpoint, reduce_lr],
+        verbose=1
+    )
+
+    # 5. Генерация и сохранение текста
+    generate_and_save(
+        model, i2w, [idx for idx in sum([[w2i[w] for w in text.split()]], [])],
+        num_words=GENERATED_WORDS,
+        temperature=TEMPERATURE,
+        out_path=GENERATED_PATH
+    )
+
+
+if __name__ == "__main__":
+    main()
